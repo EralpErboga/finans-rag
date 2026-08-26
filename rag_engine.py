@@ -107,16 +107,20 @@ Sadece SELECT ile başlayan SQL kodunu yaz:"""
     sayisal_sutunlar = [c for c in df_res.columns if 'bakiye' in c or 'borc' in c or 'alacak' in c]
     toplam_tutar = df_res[sayisal_sutunlar[0]].sum() if sayisal_sutunlar else 0.0
 
-    final_prompt = f"""Aşağıda Python/SQL motorunun hesapladığı kesin veriler yer almaktadır.
-Sayıları ve toplamı doğrudan tablodan al, matematiksel toplamı değiştirme.
+    final_prompt = f"""Sen üst düzey bir finans asistanısın. 
+    Aşağıdaki kesin verileri kullanarak kullanıcının sorusuna doğrudan, kibar ve net bir Türkçe yanıt ver.
 
-Veri Tablosu:
-{df_res.to_string(index=False)}
+    KURALLAR:
+    - Kesinlikle SQL kodu, kod bloğu (```) veya teknik açıklama YAZMA.
+    - Sadece hesap detaylarını ve nihai toplam tutarı belirt.
 
-Hesaplanan Kesin Toplam: {toplam_tutar:,.2f} TRY
+    Veri Tablosu:
+    {df_res.to_string(index=False)}
 
-Kullanıcı Sorusu: {soru}
-Cevap:"""
+    Hesaplanan Kesin Toplam: {toplam_tutar:,.2f} TRY
+
+    Kullanıcı Sorusu: {soru}
+    Cevap:"""
 
     cevap = ollama.chat(
         model="qwen2.5:7b",
