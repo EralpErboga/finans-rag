@@ -34,18 +34,20 @@ for msg in st.session_state.messages:
 
 # Yeni Soru Girişi
 if prompt := st.chat_input("Sorunuzu buraya yazın..."):
-    # Kullanıcı mesajını ekle
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    # 1. Ekrana Kullanıcı Mesajını Bas
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Yanıt Üret
+    # 2. Yanıt Üret (Mevcut session_state mesaj geçmişini motora aktar)
     with st.chat_message("assistant"):
         with st.spinner("İlgili kaynak taranıyor ve yanıt üretiliyor..."):
             try:
-                answer, source = answer_query(prompt)
+                answer, source = answer_query(prompt, chat_history=st.session_state.messages)
                 st.markdown(answer)
                 st.caption(f"📌 **Kaynak:** {source}")
+
+                # Geçmişe her iki tarafı da kaydet
+                st.session_state.messages.append({"role": "user", "content": prompt})
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": answer,

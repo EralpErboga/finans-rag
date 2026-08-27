@@ -1,82 +1,29 @@
 import os
 import json
 import math
-import sqlite3
+import re
 import pandas as pd
 import ollama
-import re
 
 VECTOR_DB_PATH = "db/mevzuat_vektorleri.json"
 EXCEL_PATH = "data/mizan_bilanco_dummy_2024.xlsx"
 
 
-# Çince/Bozuk Karakter Temizleyici
 def clean_text(text: str) -> str:
     text = re.sub(r'[\u4e00-\u9fff]+', '', text)
     return text.strip()
 
 
-# Güvenli Para Formatlayıcı (Örn: 24.300.000,00 TL)
 def format_try(val) -> str:
     try:
         val_float = float(val)
-        if math.isnan(val_float):
-            return ""
+        if math.isnan(val_float) or pd.isna(val_float):
+            return "0,00 TL"
         return f"{val_float:,.2f} TL".replace(",", "X").replace(".", ",").replace("X", ".")
     except (ValueError, TypeError):
         return str(val)
 
 
-# Ortak Mali Tablo Yükleyici & Formatlayıcı
-def load_formatted_financial_tables():
-    xls = pd.ExcelFile(EXCEL_PATH)
-
-    # 1. Gelir Tablosu
-    df_gelir = pd.read_excel(xls, sheet_name="Gelir Tablosu").dropna(how='all')
-    gelir_lines = []
-    for _, row in df_gelir.iterrows():
-        kalem = str(row.iloc[0]).strip()
-        tutar = format_try(row.iloc[1]) if len(row) > 1 else ""
-        gelir_lines.append(f"{kalem}: {tutar}")
-    gelir_metni = "\n".join(gelir_lines)
-
-    # 2. Bilanço
-    df_bilanco = pd.read_excel(xls, sheet_name="Bilanço").dropna(how='all')
-    bilanco_lines = []
-    for _, row in df_bilanco.iterrows():
-        kalem = str(row.iloc[0]).strip()
-        tutar = format_try(row.iloc[1]) if len(row) > 1 else ""
-        bilanco_lines.append(f"{kalem}: {tutar}")
-    bilanco_metni = "\n".join(bilanco_lines)
-
-    # 3. Mizan Tablosu
-    df_mizan = pd.read_excel(xls, sheet_name="Mizan", header=4).dropna(subset=['Hesap Kodu'])
-    mizan_lines = []
-    for _, row in df_mizan.iterrows():
-        kod = int(row['Hesap Kodu'])
-        ad = str(row['Hesap Adı']).strip()
-        b_bak = float(row['Borç Bakiye']) if pd.notna(row['Borç Bakiye']) else 0.0
-        a_bak = float(row['Alacak Bakiye']) if pd.notna(row['Alacak Bakiye']) else 0.0
-
-        tutar_str = f"Borç: {format_try(b_bak)}" if b_bak > 0 else f"Alacak: {format_try(a_bak)}"
-        mizan_lines.append(f"Hesap {kod} - {ad}: {tutar_str}")
-    mizan_metni = "\n".join(mizan_lines)
-
-    # Önceden hesaplanmış kritik hazır değerler
-    kasa_val = df_mizan.loc[df_mizan['Hesap Kodu'] == 100, 'Borç Bakiye'].sum()
-    banka_val = df_mizan.loc[df_mizan['Hesap Kodu'] == 102, 'Borç Bakiye'].sum()
-    hazir_degerler_toplam = kasa_val + banka_val
-
-    on_hesaplar = (
-        f"- Kasa Hesabı (100): {format_try(kasa_val)}\n"
-        f"- Bankalar Hesabı (102): {format_try(banka_val)}\n"
-        f"- Toplam Hazır Değerler (Kasa + Banka): {format_try(hazir_degerler_toplam)}"
-    )
-
-    return gelir_metni, bilanco_metni, mizan_metni, on_hesaplar
-
-
-# 1. Benzerlik Fonksiyonu
 def cosine_similarity(vec_a, vec_b):
     dot = sum(a * b for a, b in zip(vec_a, vec_b))
     norm_a = math.sqrt(sum(a * a for a in vec_a))
@@ -84,57 +31,110 @@ def cosine_similarity(vec_a, vec_b):
     return dot / (norm_a * norm_b) if (norm_a and norm_b) else 0.0
 
 
-# 2. Mevzuat RAG Hattı
-def query_mevzuat(soru: str):
+def retrieve_mevzuat(soru: str, top_k: int = 2):
     if not os.path.exists(VECTOR_DB_PATH):
-        return "Vektör veritabanı bulunamadı. Lütfen önce ingest.py çalıştırın.", "Hata"
+        return "", []
 
     with open(VECTOR_DB_PATH, "r", encoding="utf-8") as f:
         db = json.load(f)
 
-    baglam = "\n\n".join([f"[{item['source']}]\n{item['content']}" for item in db])
-    kaynaklar = ", ".join(list(set([item["source"] for item in db])))
+    # Soruyu bge-m3 ile vektörleştir
+    res = ollama.embeddings(model="bge-m3", prompt=soru)
+    soru_vektoru = res["embedding"]
 
-    prompt = f"""Sen enerji şirketi finans ve mevzuat biriminde görevli bir danışmansın.
-Aşağıda şirketin tabi olduğu EPDK mevzuat belgeleri yer almaktadır:
+    # Benzerlik sıralaması
+    skorlar = []
+    for item in db:
+        skor = cosine_similarity(soru_vektoru, item["embedding"])
+        skorlar.append((skor, item))
 
-=== EPDK MEVZUAT METİNLERİ ===
-{baglam}
+    skorlar.sort(key=lambda x: x[0], reverse=True)
+    en_iyi = [item for _, item in skorlar[:top_k]]
 
-Kullanıcı Sorusu: {soru}
-
-KURALLAR:
-1. Sadece yukarıdaki bağlamda yer alan maddelere ve kurallara dayanarak cevap ver.
-2. Bağlam dışından kurum, kurul veya kural uydurma.
-3. Cevabın sonuna referans aldığın belge adını ve madde başlığını ekle.
-
-Cevap (Türkçe):"""
-
-    cevap = ollama.chat(
-        model="qwen2.5:7b",
-        messages=[{"role": "user", "content": prompt}],
-        options={"temperature": 0.0}
-    )
-    return clean_text(cevap["message"]["content"]), f"EPDK Mevzuatı ({kaynaklar})"
+    baglam = "\n\n".join([f"[{item['source']}]\n{item['content']}" for item in en_iyi])
+    kaynaklar = list(set([item["source"] for item in en_iyi]))
+    return baglam, kaynaklar
 
 
-# 3. SQLite Bağlantısı
-def get_db_connection():
-    conn = sqlite3.connect(":memory:")
+def load_formatted_financial_tables():
+    if not os.path.exists(EXCEL_PATH):
+        return "", "", "", ""
+
     xls = pd.ExcelFile(EXCEL_PATH)
+
+    # 1. Gelir Tablosu
+    df_gelir = pd.read_excel(xls, sheet_name="Gelir Tablosu").dropna(how='all')
+    gelir_lines = []
+    toplam_gelir = 0.0
+    for _, row in df_gelir.iterrows():
+        if len(row) > 1:
+            kalem = str(row.iloc[0]).strip()
+            tutar_ham = row.iloc[1]
+            gelir_lines.append(f"{kalem}: {format_try(tutar_ham)}")
+            try:
+                val_f = float(tutar_ham)
+                if not math.isnan(val_f) and val_f > 0:
+                    toplam_gelir += val_f
+            except (ValueError, TypeError):
+                pass
+    gelir_metni = "\n".join(gelir_lines)
+
+    # 2. Bilanço
+    df_bilanco = pd.read_excel(xls, sheet_name="Bilanço").dropna(how='all')
+    bilanco_lines = []
+    for _, row in df_bilanco.iterrows():
+        if len(row) > 1:
+            kalem = str(row.iloc[0]).strip()
+            bilanco_lines.append(f"{kalem}: {format_try(row.iloc[1])}")
+    bilanco_metni = "\n".join(bilanco_lines)
+
+    # 3. Mizan Tablosu
     df_mizan = pd.read_excel(xls, sheet_name="Mizan", header=4).dropna(subset=['Hesap Kodu'])
-    df_mizan['Hesap Kodu'] = df_mizan['Hesap Kodu'].astype(int)
-    df_mizan.columns = ['hesap_kodu', 'hesap_adi', 'hesap_grubu', 'borc', 'alacak', 'borc_bakiye', 'alacak_bakiye']
-    df_mizan.to_sql("mizan", conn, index=False, if_exists="replace")
-    return conn
+    kasa_toplam = 0.0
+    banka_toplam = 0.0
+    yonetim_gideri_toplam = 0.0
+    mizan_lines = []
+
+    for _, row in df_mizan.iterrows():
+        kod_str = str(row['Hesap Kodu']).strip().replace(".0", "")
+        ana_kod = kod_str.split(".")[0]
+        ad = str(row['Hesap Adı']).strip()
+        b_bak = float(row['Borç Bakiye']) if pd.notna(row['Borç Bakiye']) else 0.0
+        a_bak = float(row['Alacak Bakiye']) if pd.notna(row['Alacak Bakiye']) else 0.0
+
+        tutar_str = f"Borç: {format_try(b_bak)}" if b_bak > 0 else f"Alacak: {format_try(a_bak)}"
+        mizan_lines.append(f"Hesap {kod_str} - {ad}: {tutar_str}")
+
+        if ana_kod == "100" or kod_str.startswith("100"):
+            kasa_toplam += b_bak
+        elif ana_kod == "102" or kod_str.startswith("102"):
+            banka_toplam += b_bak
+        # 632 veya 770 kodları ile 'Genel Yönetim' başlıklarını kapsar
+        elif ana_kod in ["632", "770"] or kod_str.startswith(("632", "770")) or "genel yönetim" in ad.lower():
+            yonetim_gideri_toplam += b_bak
+
+    mizan_metni = "\n".join(mizan_lines)
+    hazir_degerler_toplam = kasa_toplam + banka_toplam
+
+    on_hesaplar = (
+        f"- Kasa Hesabı Toplamı (100): {format_try(kasa_toplam)}\n"
+        f"- Bankalar Hesabı Toplamı (102): {format_try(banka_toplam)}\n"
+        f"- Toplam Hazır Değerler (Kasa + Banka): {format_try(hazir_degerler_toplam)}\n"
+        f"- 2024 Yılı Toplam Gelir: {format_try(toplam_gelir)}\n"
+        f"- 2024 Yılı Toplam Genel Yönetim Gideri (632 / 770 Grubu): {format_try(yonetim_gideri_toplam)}"
+    )
+
+    return gelir_metni, bilanco_metni, mizan_metni, on_hesaplar
 
 
-# 4. Mali Tablo Hattı
 def query_financial(soru: str):
     gelir_metni, bilanco_metni, mizan_metni, on_hesaplar = load_formatted_financial_tables()
 
-    prompt = f"""Sen üst düzey bir mali müşavir ve denetim uzmanısın.
-Aşağıda şirketin 2024 yılı resmi mali tabloları yer almaktadır:
+    prompt = f"""Sen resmi mali tablolar denetçisisin.
+Aşağıda şirketin 2024 yılı mali tabloları ve önceden hesaplanmış resmi değerleri yer almaktadır:
+
+=== ÖN HESAPLANMIŞ RESMİ DEĞERLER ===
+{on_hesaplar}
 
 === GELİR TABLOSU ===
 {gelir_metni}
@@ -145,15 +145,12 @@ Aşağıda şirketin 2024 yılı resmi mali tabloları yer almaktadır:
 === MİZAN HESAPLARI ===
 {mizan_metni}
 
-=== ÖN HESAPLANMIŞ KESİN DEĞERLER ===
-{on_hesaplar}
-
 Kullanıcı Sorusu: {soru}
 
-GÖREVİN VE KESİN KURALLAR:
-1. İstenen tutarları tablolardaki ve ön hesaplanmış resmi değerlerdeki net haliyle (noktası, virgülüyle) yaz.
-2. Kafandan ek aritmetik veya tahmini hesaplama yapma.
-3. Maddeler halinde net ve anlaşılır açıkla.
+GÖREVİN:
+1. Sorulan tutarı ön hesaplanmış resmi değerlerden veya ilgili tablodan bularak net olarak yaz.
+2. Bilgi tablolarda yoksa "Belgelerde bu bilgi bulunmamaktadır." de.
+3. Kafandan tahmin veya ek aritmetik yürütme.
 
 Cevap:"""
 
@@ -162,94 +159,70 @@ Cevap:"""
         messages=[{"role": "user", "content": prompt}],
         options={"temperature": 0.0}
     )
-    return clean_text(cevap["message"]["content"]), "Mali Tablolar (Bilanço & Gelir Tablosu & Mizan)"
-# 5. Birleşik (Hibrit) Hat: Görev Ayrımı Netleştirilmiş Mimari
-def query_combined(soru: str):
-    if not os.path.exists(VECTOR_DB_PATH):
-        return "Vektör veritabanı bulunamadı.", "Hata"
+    return clean_text(cevap["message"]["content"]), "Mali Tablolar (Mizan & Bilanço & Gelir Tablosu)"
 
-    gelir_metni, bilanco_metni, mizan_metni, on_hesaplar = load_formatted_financial_tables()
 
-    # --- 1. AŞAMA: Sadece Mali/Sayısal Verileri Çek ---
-    mali_prompt = f"""Sen bir mali müşavirsin. Aşağıdaki mali tablolara bakarak kullanıcının sorusundaki SADECE finansal/parasal/gider tutarlarını cevapla.
+def query_mevzuat(soru: str):
+    baglam, kaynaklar = retrieve_mevzuat(soru, top_k=2)
+    if not baglam:
+        return "İlgili mevzuat belgesi bulunamadı. Lütfen ingest.py scriptini çalıştırın.", "Hata"
 
-=== GELİR TABLOSU ===
-{gelir_metni}
+    prompt = f"""Sen enerji sektörü mevzuat danışmanısın.
+Aşağıda EPDK mevzuatından ilgili maddeler yer almaktadır:
 
-=== BİLANÇO ===
-{bilanco_metni}
+=== İLGİLİ MEVZUAT METİNLERİ ===
+{baglam}
 
-=== MİZAN HESAPLARI ===
-{mizan_metni}
+Kullanıcı Sorusu: {soru}
 
-Soru: {soru}
+KURALLAR:
+1. Sadece yukarıdaki mevzuat maddelerine dayanarak net cevap ver.
+2. Bilgi metinde yoksa "Belgelerde bu bilgi bulunmamaktadır." de.
+3. Cevabın altına referans aldığın belge adını ve madde başlığını ekle.
 
-GÖREV: 
-- SADECE soruda istenen parasal toplamları veya hesap tutarlarını yaz.
-- Soru içindeki mevzuat/kural kısımlarına kesinlikle girme, mizanı gereksiz yere baştan sona listeleme.
-- Başlık: **Mali Veriler & Gider/Gelir Analizi**"""
+Cevap:"""
 
-    mali_yanit = ollama.chat(
+    cevap = ollama.chat(
         model="qwen2.5:7b",
-        messages=[{"role": "user", "content": mali_prompt}],
+        messages=[{"role": "user", "content": prompt}],
         options={"temperature": 0.0}
-    )["message"]["content"].strip()
+    )
+    kaynak_str = ", ".join(kaynaklar) if kaynaklar else "EPDK Mevzuatı"
+    return clean_text(cevap["message"]["content"]), f"EPDK Mevzuatı ({kaynak_str})"
 
-    # --- 2. AŞAMA: Sadece Mevzuat/Yönetmelik Kuralını Çek ---
-    with open(VECTOR_DB_PATH, "r", encoding="utf-8") as f:
-        db = json.load(f)
-    mevzuat_baglam = "\n\n".join([f"[{item['source']}]\n{item['content']}" for item in db])
 
-    mevzuat_prompt = f"""Sen bir EPDK mevzuat danışmanısın.
-Aşağıda EPDK mevzuat belgeleri yer almaktadır:
+def answer_query(user_query: str, chat_history: list = None):
+    # 1. Sohbet Geçmişi / Hafıza Tespiti (Deterministik Python Katmanı)
+    q_lower = user_query.lower()
+    gecmis_tetikleyicileri = [
+        "mesaj", "soru", "yaz", "sord", "konus", "konuş", "neydi",
+        "ilk", "son", "onceki", "önceki", "az önce", "azonce", "bastan", "baştan",
+        "ondan", "sonrakinde", "peki ya"
+    ]
 
-{mevzuat_baglam}
+    user_messages = [msg["content"] for msg in chat_history if msg["role"] == "user"] if chat_history else []
 
-Soru: {soru}
+    if any(t in q_lower for t in gecmis_tetikleyicileri) and user_messages:
+        sayilar = re.findall(r'\d+', user_query)
+        if sayilar:
+            sira = int(sayilar[0])
+            if 1 <= sira <= len(user_messages):
+                return f"Baştan {sira}. mesajınızda şunu yazmıştınız: \"{user_messages[sira - 1]}\"", "Sohbet Belleği"
+            return f"Toplam {len(user_messages)} mesajınız var. {sira}. mesaj bulunamadı.", "Sohbet Belleği"
 
-GÖREV:
-- Soruda geçen mevzuat/yönetmelik kuralını (Örn: Düzenlenmiş Varlık Tabanı koşulları, faydalı ömür, hedefler vb.) ilgili maddeye göre açıkla.
-- En sona ilgili mevzuat belgesi adını ve Madde numarasını referans olarak ekle.
-- Başlık: **İlgili EPDK Mevzuat Hükmü**"""
+        if "ilk" in q_lower:
+            return f"İlk mesajınızda şunu yazmıştınız: \"{user_messages[0]}\"", "Sohbet Belleği"
 
-    mevzuat_yanit = ollama.chat(
-        model="qwen2.5:7b",
-        messages=[{"role": "user", "content": mevzuat_prompt}],
-        options={"temperature": 0.0}
-    )["message"]["content"].strip()
+        if any(w in q_lower for w in ["önceki", "az önce", "ondan", "sonrakinde"]):
+            hedef = user_messages[-2] if len(user_messages) >= 2 else user_messages[0]
+            return f"Önceki mesajınızda şunu yazmıştınız: \"{hedef}\"", "Sohbet Belleği"
 
-    birlestirilmis_cevap = f"{mali_yanit}\n\n---\n\n{mevzuat_yanit}"
-    return clean_text(birlestirilmis_cevap), "Hibrit Motor (Mali Tablolar & Mevzuat RAG)"
-# 6. Yönlendirici (Router)
-def answer_query(user_query: str):
-    router_prompt = f"""Sen bir sorgu sınıflandırıcısısın. Kullanıcı sorusunu dikkatle oku ve sadece 3 kategoriden birini seç:
+        return f"Son mesajınızda şunu yazmıştınız: \"{user_messages[-1]}\"", "Sohbet Belleği"
 
-KATEGORİ TANIMLARI:
-1. MEVZUAT:
-   - Soru amortisman süreleri, faydalı ömür (trafo, scada, sayaç vb. kaç yıl), yasal oranlar, EPDK yönetmelikleri, tebliğler, raporlama takvimi, son bildirim tarihleri veya yasal kurallar hakkındaysa.
-
-2. TABLO:
-   - Soru şirketin mevcut bilançosundaki, gelir tablosundaki veya mizanındaki TL tutarları, hesap bakiyeleri, kâr, nakit, borç veya varlık toplamları hakkındaysa (Mevzuat/yönetmelik kuralı sormuyorsa).
-
-3. BIRLESIK:
-   - Soru HEM yasal kuralı/faydalı ömrü/tebliği HEM DE şirketin tablosundaki TL tutarını AYNI ANDA soruyorsa.
-
-Kullanıcı Sorusu: {user_query}
-Sınıflandırma (Sadece tek bir kelime: MEVZUAT, TABLO veya BIRLESIK):"""
-
-    decision = ollama.chat(
-        model="qwen2.5:7b",
-        messages=[{"role": "user", "content": router_prompt}],
-        options={"temperature": 0.0}
-    )["message"]["content"].strip().upper()
-
-    # Yönlendirme Kontrolü
-    if "BIRLES" in decision or "BİRLEŞ" in decision or "BIRLEŞ" in decision:
-        return query_combined(user_query)
-    elif "MEVZUAT" in decision or "YONETMELIK" in decision or "TEBLIG" in decision:
-        return query_mevzuat(user_query)
-    elif "TABLO" in decision or "MALI" in decision:
+    # 2. Yönlendirme (Router)
+    finans_kelimeleri = ["gelir", "gider", "yönetim", "kasa", "banka", "mizan", "bilanço", "tutar", "hesap", "tl",
+                         "nakit"]
+    if any(k in q_lower for k in finans_kelimeleri):
         return query_financial(user_query)
-    else:
-        # Kararsız kalırsa varsayılan olarak mevzuata baksın
-        return query_mevzuat(user_query)
+
+    return query_mevzuat(user_query)
