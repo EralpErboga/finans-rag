@@ -1,12 +1,12 @@
 # ⚡ Finans-RAG: Kurum İçi EPDK Mevzuatı & Mizan Asistanı
 
-Bu proje, elektrik dağıtım sektörü finans ve regülasyon ekipleri için geliştirilmiş; EPDK mevzuat dokümanları ve Excel mizan tabloları üzerinden soru-cevap yapabilen **%100 yerel (on-premise)** bir RAG (Retrieval-Augmented Generation) asistanıdır.
+Bu proje, elektrik dağıtım sektörü finans ve regülasyon ekipleri için geliştirilmiş; EPDK mevzuat dokümanları ve Excel mizan tabloları üzerinden soru-cevap yapabilen **%100 yerel** bir RAG (Retrieval-Augmented Generation) asistanıdır.
 
 ---
 
 ## 🎯 Projenin Amacı ve Problem Tanımı
 * **Veri Güvenliği:** Finansal tablolar ve kurum içi regülasyon verileri harici bulut servislerine gönderilmez; tüm süreç yerel donanımda çalışır.
-* **Sıfır Halüsinasyon (Zero-Hallucination):** 
+* **Sıfır Halüsinasyon:** 
   * Mevzuat sorgularında anlamsal arama ile doğrudan ilgili yönetmelik maddeleri referans gösterilir.
   * Mali tablolarda (Mizan, Bilanço, Gelir Tablosu) matematiksel işlemler LLM'e bırakılmaz; bellek içi SQLite ve Pandas motoru üzerinden kesin olarak hesaplanır.
 
