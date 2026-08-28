@@ -107,7 +107,7 @@ def load_formatted_financial_tables():
             kasa_toplam += b_bak
         elif ana_kod == "102" or kod_str.startswith("102"):
             banka_toplam += b_bak
-        elif ana_kod in ["632", "770"] or kod_str.startswith(("632", "770")) or "genel yönetim" in ad.lower():
+        elif ana_kod in ["632", "770", "630"] or "genel yönetim" in ad.lower():
             yonetim_gideri_toplam += b_bak
 
     mizan_metni = "\n".join(mizan_lines)
@@ -147,7 +147,7 @@ Kullanıcı Sorusu: {soru}
 GÖREVİN:
 1. Sorulan tutarı ön hesaplanmış resmi değerlerden veya ilgili tablodan bularak net olarak yaz.
 2. Bilgi tablolarda yoksa "Belgelerde bu bilgi bulunmamaktadır." de.
-3. Kafandan tahmin veya ek aritmetik yürütme.
+3. Kafandan tahmin yürütme.
 
 Cevap:"""
 
@@ -157,7 +157,39 @@ Cevap:"""
         options={"temperature": 0.0}
     )
     return clean_text(cevap["message"]["content"]), "Mali Tablolar (Mizan & Bilanço & Gelir Tablosu)"
+def query_hybrid(soru: str):
+    baglam_mevzuat, kaynaklar = retrieve_mevzuat(soru, top_k=2)
+    gelir_metni, bilanco_metni, mizan_metni, on_hesaplar = load_formatted_financial_tables()
 
+    prompt = f"""Sen enerji sektörü finans ve mevzuat danışmanısın.
+Aşağıda şirketin mali verileri ve EPDK mevzuatı yer almaktadır:
+
+=== MEVZUAT METİNLERİ ===
+{baglam_mevzuat}
+
+=== MALİ TABLOLAR & HESAPLAMALAR ===
+{on_hesaplar}
+{gelir_metni}
+
+Kullanıcı Sorusu: {soru}
+
+GÖREVİN:
+1. Mevzuat hedeflerini (varsa oranları ve gelir tavanı indirim kurallarını) özetle.
+2. Şirketin mali tablolarındaki ilgili gelir/gider kalemini belirt.
+3. Bu durumun finansal etki analizini tek bir sonuç paragrafında net ve tekrara düşmeden açıkla.
+
+Cevap:"""
+
+    cevap = ollama.chat(
+        model="qwen2.5:7b",
+        messages=[{"role": "user", "content": prompt}],
+        options={
+            "temperature": 0.1,
+            "repeat_penalty": 1.2
+        }
+    )
+    kaynak_str = ", ".join(kaynaklar) if kaynaklar else "EPDK Mevzuatı"
+    return clean_text(cevap["message"]["content"]), f"Karma (Mali Tablolar & {kaynak_str})"
 
 def query_mevzuat(soru: str):
     baglam, kaynaklar = retrieve_mevzuat(soru, top_k=2)
@@ -201,9 +233,7 @@ def answer_query(user_query: str, chat_history: list = None, last_focused_index:
     total_questions = len(user_messages)
 
     # 1. TÜM SOHBETİN ÖZETİ / LİSTESİ
-    if any(k in q_norm for k in
-           ["neler konustuk", "neler konuştuk", "özetle", "ozetle", "özet", "ozet", "bütün sorular", "tum sorular",
-            "tüm mesajlar"]):
+    if any(k in q_norm for k in ["neler konustuk", "neler konuştuk", "özetle", "ozetle", "özet", "ozet", "bütün sorular", "tum sorular", "tüm mesajlar"]):
         if not user_messages:
             return "Henüz bir mesaj geçmişi bulunmamaktadır.", "Sohbet Belleği", last_focused_index
         liste = "\n".join([f"{i + 1}. {m}" for i, m in enumerate(user_messages)])
@@ -259,43 +289,48 @@ def answer_query(user_query: str, chat_history: list = None, last_focused_index:
         sayilar = [int(s) for s in re.findall(r'\d+', user_query)]
         delta = sayilar[0] if sayilar else 1
 
-        # A) Bağıl Arama: "ondan X sonraki" / "ondan X önceki"
         if "ondan" in q_norm or "sonraki" in q_norm or "onceki" in q_norm or "önceki" in q_norm:
             base_idx = last_focused_index if last_focused_index is not None else total_questions
-
             if "sonra" in q_norm or "sonraki" in q_norm:
                 target_idx = base_idx + delta
-            else:  # "önce" veya "önceki"
+            else:
                 target_idx = base_idx - delta
 
             if 1 <= target_idx <= total_questions:
                 return f"Baştan {target_idx}. sorunuzda şunu sormuştunuz: \"{user_messages[target_idx - 1]}\"", "Sohbet Belleği", target_idx
             return f"Toplam {total_questions} sorunuz var. Hesaplanmak istenen {target_idx}. soru mevcut değil.", "Sohbet Belleği", last_focused_index
 
-        # B) Mutlak Sıralı Arama: "4. soru", "baştan 2. mesaj"
         if sayilar:
             sira = sayilar[0]
             if 1 <= sira <= total_questions:
                 return f"Baştan {sira}. sorunuzda şunu sormuştunuz: \"{user_messages[sira - 1]}\"", "Sohbet Belleği", sira
             return f"Toplam {total_questions} sorunuz var. {sira}. soru bulunamadı.", "Sohbet Belleği", last_focused_index
 
-        # C) "ilk soru"
         if "ilk" in q_norm or "1." in q_norm:
             return f"İlk sorunuzda şunu sormuştunuz: \"{user_messages[0]}\"", "Sohbet Belleği", 1
 
-        # D) "son soru"
         return f"Son sorunuzda şunu sormuştunuz: \"{user_messages[-1]}\"", "Sohbet Belleği", total_questions
 
-    # 5. FİNANSAL TABLOLAR
-    finans_kelimeleri = [
-        "gelir", "gider", "yönetim", "kasa", "banka", "mizan", "bilanço", "tutar", "hesap",
-        "tl", "nakit", "alacak", "borç", "ticari", "şüpheli", "aktif", "pasif", "özkaynak",
-        "varlık", "duran", "dönen", "amortisman payı", "kâr", "zarar", "maliyet"
-    ]
-    if any(k in q_norm for k in finans_kelimeleri):
+    # 5. KARMA / HİBRİT SORGULAR (Mevzuat + Mali Etki)
+    mevzuat_kelimeleri = ["hedef", "kayıp", "kaçak", "tebliğ", "yönetmelik", "dvt", "amortisman süresi"]
+    finans_kelimeleri = ["gelir", "gider", "yönetim", "kasa", "banka", "mizan", "bilanço", "tutar", "hesap", "tl", "nakit", "alacak", "borç", "ticari", "şüpheli", "aktif", "pasif", "özkaynak", "kâr", "zarar"]
+
+    has_mevzuat = any(k in q_norm for k in mevzuat_kelimeleri)
+    has_finans = any(k in q_norm for k in finans_kelimeleri)
+
+    if has_mevzuat and has_finans and len(q_norm.split()) > 5:
+        ans, src = query_hybrid(user_query)
+        return ans, src, last_focused_index
+
+    # 6. FİNANSAL TABLOLAR
+    if has_finans:
         ans, src = query_financial(user_query)
         return ans, src, last_focused_index
 
-    # 6. MEVZUAT RAG
-    ans, src = query_mevzuat(user_query)
+    # 7. MEVZUAT RAG (Kısa takip sorularında bağlam zenginleştirme)
+    arama_metni = user_query
+    if len(q_norm.split()) <= 3 and user_messages:
+        arama_metni = f"{user_messages[-1]} {user_query}"
+
+    ans, src = query_mevzuat(arama_metni)
     return ans, src, last_focused_index
