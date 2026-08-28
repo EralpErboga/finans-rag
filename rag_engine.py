@@ -38,11 +38,9 @@ def retrieve_mevzuat(soru: str, top_k: int = 2):
     with open(VECTOR_DB_PATH, "r", encoding="utf-8") as f:
         db = json.load(f)
 
-    # Soruyu bge-m3 ile vektörleştir
     res = ollama.embeddings(model="bge-m3", prompt=soru)
     soru_vektoru = res["embedding"]
 
-    # Benzerlik sıralaması
     skorlar = []
     for item in db:
         skor = cosine_similarity(soru_vektoru, item["embedding"])
@@ -109,7 +107,6 @@ def load_formatted_financial_tables():
             kasa_toplam += b_bak
         elif ana_kod == "102" or kod_str.startswith("102"):
             banka_toplam += b_bak
-        # 632 veya 770 kodları ile 'Genel Yönetim' başlıklarını kapsar
         elif ana_kod in ["632", "770"] or kod_str.startswith(("632", "770")) or "genel yönetim" in ad.lower():
             yonetim_gideri_toplam += b_bak
 
@@ -191,38 +188,72 @@ Cevap:"""
     return clean_text(cevap["message"]["content"]), f"EPDK Mevzuatı ({kaynak_str})"
 
 
-def answer_query(user_query: str, chat_history: list = None):
-    # 1. Sohbet Geçmişi / Hafıza Tespiti (Deterministik Python Katmanı)
-    q_lower = user_query.lower()
-    gecmis_tetikleyicileri = [
-        "mesaj", "soru", "yaz", "sord", "konus", "konuş", "neydi",
-        "ilk", "son", "onceki", "önceki", "az önce", "azonce", "bastan", "baştan",
-        "ondan", "sonrakinde", "peki ya"
-    ]
+def normalize_text(text: str) -> str:
+    mapping = {'İ': 'i', 'I': 'ı', 'Ş': 'ş', 'Ğ': 'ğ', 'Ü': 'ü', 'Ö': 'ö', 'Ç': 'ç'}
+    for k, v in mapping.items():
+        text = text.replace(k, v)
+    return text.lower().strip()
 
+
+def answer_query(user_query: str, chat_history: list = None):
+    q_norm = normalize_text(user_query)
     user_messages = [msg["content"] for msg in chat_history if msg["role"] == "user"] if chat_history else []
 
-    if any(t in q_lower for t in gecmis_tetikleyicileri) and user_messages:
-        sayilar = re.findall(r'\d+', user_query)
+    # 1. TÜM SOHBETİN ÖZETİ / LİSTESİ
+    if any(k in q_norm for k in ["neler konustuk", "neler konuştuk", "özetle", "ozetle", "özet", "ozet", "bütün sorular", "tum sorular", "tüm mesajlar"]):
+        if not user_messages:
+            return "Henüz bir mesaj geçmişi bulunmamaktadır.", "Sohbet Belleği"
+        liste = "\n".join([f"{i + 1}. {m}" for i, m in enumerate(user_messages)])
+        return f"Şu ana kadar sorduğunuz sorular:\n\n{liste}", "Sohbet Belleği"
+
+    # 2. İÇERİK BAZLI GEÇMİŞ ARAMASI ("hangi soruda / nerede sordum / ne zaman dedim")
+    if any(k in q_norm for k in ["hangi", "nerede", "ne zaman"]):
+        stop_words = {
+            "hangi", "mesajda", "mesaj", "soruda", "soru", "sordumu", "sordum", "sordugumu", "sorduğumu",
+            "nerede", "ne", "zaman", "diye", "veya", "gecen", "geçen", "içeren", "hakkinda", "hakkında",
+            "dedim", "dedigimi", "dediğimi", "yazdim", "yazdım", "soyledim", "söyledim", "bahsettim"
+        }
+
+        raw_words = re.findall(r'\b[a-zA-ZçğıöşüÇĞİÖŞÜ0-9]{2,}\b', q_norm)
+        arananlar = [w for w in raw_words if w not in stop_words]
+
+        if arananlar and user_messages:
+            for i, m in enumerate(user_messages):
+                m_norm = normalize_text(m)
+                if any(w in m_norm.split() or w in m_norm for w in arananlar):
+                    return f"Bu konuyu baştan **{i + 1}. sorunuzda** sormuştunuz: \"{m}\"", "Sohbet Belleği"
+
+            for i, m in enumerate(user_messages):
+                m_norm = normalize_text(m)
+                if any(w[:4] in m_norm for w in arananlar if len(w) >= 4):
+                    return f"Bu konuyu baştan **{i + 1}. sorunuzda** sormuştunuz: \"{m}\"", "Sohbet Belleği"
+
+            return "Sohbet geçmişinde bu içerikle eşleşen bir soru bulunamadı.", "Sohbet Belleği"
+
+    # 3. SIRALI GEÇMİŞ SORGULARI (Sayı / İlk / Son / Önceki)
+    sayilar = re.findall(r'\d+', user_query)
+    sira_kelimeleri = ["ilk", "son", "onceki", "önceki", "az önce", "azonce", "bastan", "baştan", "ondan", "sonrakinde", "peki ya"]
+
+    if (sayilar or any(t in q_norm for t in sira_kelimeleri)) and user_messages:
         if sayilar:
             sira = int(sayilar[0])
             if 1 <= sira <= len(user_messages):
                 return f"Baştan {sira}. mesajınızda şunu yazmıştınız: \"{user_messages[sira - 1]}\"", "Sohbet Belleği"
             return f"Toplam {len(user_messages)} mesajınız var. {sira}. mesaj bulunamadı.", "Sohbet Belleği"
 
-        if "ilk" in q_lower:
+        if "ilk" in q_norm or "1." in q_norm:
             return f"İlk mesajınızda şunu yazmıştınız: \"{user_messages[0]}\"", "Sohbet Belleği"
 
-        if any(w in q_lower for w in ["önceki", "az önce", "ondan", "sonrakinde"]):
+        if any(w in q_norm for w in ["önceki", "onceki", "az önce", "ondan", "sonrakinde"]):
             hedef = user_messages[-2] if len(user_messages) >= 2 else user_messages[0]
             return f"Önceki mesajınızda şunu yazmıştınız: \"{hedef}\"", "Sohbet Belleği"
 
         return f"Son mesajınızda şunu yazmıştınız: \"{user_messages[-1]}\"", "Sohbet Belleği"
 
-    # 2. Yönlendirme (Router)
-    finans_kelimeleri = ["gelir", "gider", "yönetim", "kasa", "banka", "mizan", "bilanço", "tutar", "hesap", "tl",
-                         "nakit"]
-    if any(k in q_lower for k in finans_kelimeleri):
+    # 4. FİNANSAL TABLOLAR (Mizan / Bilanço / Gelir Tablosu)
+    finans_kelimeleri = ["gelir", "gider", "yönetim", "kasa", "banka", "mizan", "bilanço", "tutar", "hesap", "tl", "nakit"]
+    if any(k in q_norm for k in finans_kelimeleri):
         return query_financial(user_query)
 
+    # 5. MEVZUAT RAG
     return query_mevzuat(user_query)
