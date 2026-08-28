@@ -21,9 +21,12 @@ with st.sidebar:
 st.title("⚡ Finans-RAG: EPDK Mevzuatı & Mizan Asistanı")
 st.caption("Veri güvenliği garantili, kurum içi yapay zeka soru-cevap asistanı")
 
-# Mesaj Geçmişini Başlat
+# Durum Değişkenleri (State)
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+if "last_focused_index" not in st.session_state:
+    st.session_state.last_focused_index = None
 
 # Eski Mesajları Listele
 for msg in st.session_state.messages:
@@ -34,19 +37,22 @@ for msg in st.session_state.messages:
 
 # Yeni Soru Girişi
 if prompt := st.chat_input("Sorunuzu buraya yazın..."):
-    # 1. Ekrana Kullanıcı Mesajını Bas
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # 2. Yanıt Üret (Mevcut session_state mesaj geçmişini motora aktar)
     with st.chat_message("assistant"):
         with st.spinner("İlgili kaynak taranıyor ve yanıt üretiliyor..."):
             try:
-                answer, source = answer_query(prompt, chat_history=st.session_state.messages)
+                answer, source, new_focused_idx = answer_query(
+                    prompt,
+                    chat_history=st.session_state.messages,
+                    last_focused_index=st.session_state.last_focused_index
+                )
                 st.markdown(answer)
                 st.caption(f"📌 **Kaynak:** {source}")
 
-                # Geçmişe her iki tarafı da kaydet
+                # Durumu güncelle
+                st.session_state.last_focused_index = new_focused_idx
                 st.session_state.messages.append({"role": "user", "content": prompt})
                 st.session_state.messages.append({
                     "role": "assistant",

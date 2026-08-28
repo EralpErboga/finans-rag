@@ -195,25 +195,46 @@ def normalize_text(text: str) -> str:
     return text.lower().strip()
 
 
-def answer_query(user_query: str, chat_history: list = None):
+def answer_query(user_query: str, chat_history: list = None, last_focused_index: int = None):
     q_norm = normalize_text(user_query)
     user_messages = [msg["content"] for msg in chat_history if msg["role"] == "user"] if chat_history else []
+    total_questions = len(user_messages)
 
     # 1. TÜM SOHBETİN ÖZETİ / LİSTESİ
-    if any(k in q_norm for k in ["neler konustuk", "neler konuştuk", "özetle", "ozetle", "özet", "ozet", "bütün sorular", "tum sorular", "tüm mesajlar"]):
+    if any(k in q_norm for k in
+           ["neler konustuk", "neler konuştuk", "özetle", "ozetle", "özet", "ozet", "bütün sorular", "tum sorular",
+            "tüm mesajlar"]):
         if not user_messages:
-            return "Henüz bir mesaj geçmişi bulunmamaktadır.", "Sohbet Belleği"
+            return "Henüz bir mesaj geçmişi bulunmamaktadır.", "Sohbet Belleği", last_focused_index
         liste = "\n".join([f"{i + 1}. {m}" for i, m in enumerate(user_messages)])
-        return f"Şu ana kadar sorduğunuz sorular:\n\n{liste}", "Sohbet Belleği"
+        return f"Şu ana kadar sorduğunuz {total_questions} soru:\n\n{liste}", "Sohbet Belleği", last_focused_index
 
-    # 2. İÇERİK BAZLI GEÇMİŞ ARAMASI ("hangi soruda / nerede sordum / ne zaman dedim")
+    # 2. MESAJ İÇİ KELİME SORGULARI (Örn: "ilk mesajın 3. kelimesi ne")
+    if ("kelime" in q_norm or "kelimesi" in q_norm) and user_messages:
+        sayilar = [int(s) for s in re.findall(r'\d+', user_query)]
+        target_idx = 0
+        if "ilk" in q_norm or "1." in q_norm:
+            target_idx = 0
+        elif "son" in q_norm:
+            target_idx = total_questions - 1
+        elif sayilar:
+            target_idx = sayilar[0] - 1
+
+        if 0 <= target_idx < total_questions:
+            target_msg = user_messages[target_idx]
+            kelimeler = [w for w in re.sub(r'[^\w\s]', '', target_msg).split() if w]
+            k_sira = sayilar[-1] if len(sayilar) > 1 else 1
+            if 1 <= k_sira <= len(kelimeler):
+                return f"İlgili sorudaki {k_sira}. kelime: **\"{kelimeler[k_sira - 1]}\"**", "Sohbet Belleği", target_idx + 1
+            return f"Soruda toplam {len(kelimeler)} kelime var. {k_sira}. kelime bulunamadı.", "Sohbet Belleği", target_idx + 1
+
+    # 3. İÇERİK BAZLI GEÇMİŞ ARAMASI ("hangi soruda / nerede sordum")
     if any(k in q_norm for k in ["hangi", "nerede", "ne zaman"]):
         stop_words = {
             "hangi", "mesajda", "mesaj", "soruda", "soru", "sordumu", "sordum", "sordugumu", "sorduğumu",
             "nerede", "ne", "zaman", "diye", "veya", "gecen", "geçen", "içeren", "hakkinda", "hakkında",
             "dedim", "dedigimi", "dediğimi", "yazdim", "yazdım", "soyledim", "söyledim", "bahsettim"
         }
-
         raw_words = re.findall(r'\b[a-zA-ZçğıöşüÇĞİÖŞÜ0-9]{2,}\b', q_norm)
         arananlar = [w for w in raw_words if w not in stop_words]
 
@@ -221,39 +242,60 @@ def answer_query(user_query: str, chat_history: list = None):
             for i, m in enumerate(user_messages):
                 m_norm = normalize_text(m)
                 if any(w in m_norm.split() or w in m_norm for w in arananlar):
-                    return f"Bu konuyu baştan **{i + 1}. sorunuzda** sormuştunuz: \"{m}\"", "Sohbet Belleği"
-
+                    return f"Bu konuyu baştan **{i + 1}. sorunuzda** sormuştunuz: \"{m}\"", "Sohbet Belleği", i + 1
             for i, m in enumerate(user_messages):
                 m_norm = normalize_text(m)
                 if any(w[:4] in m_norm for w in arananlar if len(w) >= 4):
-                    return f"Bu konuyu baştan **{i + 1}. sorunuzda** sormuştunuz: \"{m}\"", "Sohbet Belleği"
+                    return f"Bu konuyu baştan **{i + 1}. sorunuzda** sormuştunuz: \"{m}\"", "Sohbet Belleği", i + 1
+            return "Sohbet geçmişinde bu içerikle eşleşen bir soru bulunamadı.", "Sohbet Belleği", last_focused_index
 
-            return "Sohbet geçmişinde bu içerikle eşleşen bir soru bulunamadı.", "Sohbet Belleği"
+    # 4. DİNAMİK / BAĞIL GEÇMİŞ VE SIRALI GEÇMİŞ SORGULARI
+    gecmis_tetikleyicileri = [
+        "mesaj", "soru", "yaz", "sord", "neydi", "ilk", "son",
+        "onceki", "önceki", "az önce", "bastan", "baştan", "ondan", "sonraki"
+    ]
 
-    # 3. SIRALI GEÇMİŞ SORGULARI (Sayı / İlk / Son / Önceki)
-    sayilar = re.findall(r'\d+', user_query)
-    sira_kelimeleri = ["ilk", "son", "onceki", "önceki", "az önce", "azonce", "bastan", "baştan", "ondan", "sonrakinde", "peki ya"]
+    if any(t in q_norm for t in gecmis_tetikleyicileri) and user_messages:
+        sayilar = [int(s) for s in re.findall(r'\d+', user_query)]
+        delta = sayilar[0] if sayilar else 1
 
-    if (sayilar or any(t in q_norm for t in sira_kelimeleri)) and user_messages:
+        # A) Bağıl Arama: "ondan X sonraki" / "ondan X önceki"
+        if "ondan" in q_norm or "sonraki" in q_norm or "onceki" in q_norm or "önceki" in q_norm:
+            base_idx = last_focused_index if last_focused_index is not None else total_questions
+
+            if "sonra" in q_norm or "sonraki" in q_norm:
+                target_idx = base_idx + delta
+            else:  # "önce" veya "önceki"
+                target_idx = base_idx - delta
+
+            if 1 <= target_idx <= total_questions:
+                return f"Baştan {target_idx}. sorunuzda şunu sormuştunuz: \"{user_messages[target_idx - 1]}\"", "Sohbet Belleği", target_idx
+            return f"Toplam {total_questions} sorunuz var. Hesaplanmak istenen {target_idx}. soru mevcut değil.", "Sohbet Belleği", last_focused_index
+
+        # B) Mutlak Sıralı Arama: "4. soru", "baştan 2. mesaj"
         if sayilar:
-            sira = int(sayilar[0])
-            if 1 <= sira <= len(user_messages):
-                return f"Baştan {sira}. mesajınızda şunu yazmıştınız: \"{user_messages[sira - 1]}\"", "Sohbet Belleği"
-            return f"Toplam {len(user_messages)} mesajınız var. {sira}. mesaj bulunamadı.", "Sohbet Belleği"
+            sira = sayilar[0]
+            if 1 <= sira <= total_questions:
+                return f"Baştan {sira}. sorunuzda şunu sormuştunuz: \"{user_messages[sira - 1]}\"", "Sohbet Belleği", sira
+            return f"Toplam {total_questions} sorunuz var. {sira}. soru bulunamadı.", "Sohbet Belleği", last_focused_index
 
+        # C) "ilk soru"
         if "ilk" in q_norm or "1." in q_norm:
-            return f"İlk mesajınızda şunu yazmıştınız: \"{user_messages[0]}\"", "Sohbet Belleği"
+            return f"İlk sorunuzda şunu sormuştunuz: \"{user_messages[0]}\"", "Sohbet Belleği", 1
 
-        if any(w in q_norm for w in ["önceki", "onceki", "az önce", "ondan", "sonrakinde"]):
-            hedef = user_messages[-2] if len(user_messages) >= 2 else user_messages[0]
-            return f"Önceki mesajınızda şunu yazmıştınız: \"{hedef}\"", "Sohbet Belleği"
+        # D) "son soru"
+        return f"Son sorunuzda şunu sormuştunuz: \"{user_messages[-1]}\"", "Sohbet Belleği", total_questions
 
-        return f"Son mesajınızda şunu yazmıştınız: \"{user_messages[-1]}\"", "Sohbet Belleği"
-
-    # 4. FİNANSAL TABLOLAR (Mizan / Bilanço / Gelir Tablosu)
-    finans_kelimeleri = ["gelir", "gider", "yönetim", "kasa", "banka", "mizan", "bilanço", "tutar", "hesap", "tl", "nakit"]
+    # 5. FİNANSAL TABLOLAR
+    finans_kelimeleri = [
+        "gelir", "gider", "yönetim", "kasa", "banka", "mizan", "bilanço", "tutar", "hesap",
+        "tl", "nakit", "alacak", "borç", "ticari", "şüpheli", "aktif", "pasif", "özkaynak",
+        "varlık", "duran", "dönen", "amortisman payı", "kâr", "zarar", "maliyet"
+    ]
     if any(k in q_norm for k in finans_kelimeleri):
-        return query_financial(user_query)
+        ans, src = query_financial(user_query)
+        return ans, src, last_focused_index
 
-    # 5. MEVZUAT RAG
-    return query_mevzuat(user_query)
+    # 6. MEVZUAT RAG
+    ans, src = query_mevzuat(user_query)
+    return ans, src, last_focused_index
