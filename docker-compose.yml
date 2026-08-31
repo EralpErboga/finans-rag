@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  finans-rag-app:
+    build: .
+    container_name: finans_rag_assistant
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./db:/app/db
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
