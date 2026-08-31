@@ -94,7 +94,7 @@ def load_formatted_financial_tables():
             bilanco_lines.append(f"{kalem}: {format_try(row.iloc[1])}")
     bilanco_metni = "\n".join(bilanco_lines)
 
-    # 3. Mizan (Başlıklar 5. satırda yer alır: header=4)
+    # 3. Mizan
     df_mizan = pd.read_excel(xls, sheet_name="Mizan", header=4)
     df_mizan.columns = [str(c).strip() for c in df_mizan.columns]
     df_mizan = df_mizan.dropna(subset=['Hesap Kodu'])
@@ -129,10 +129,12 @@ def load_formatted_financial_tables():
     )
 
     return gelir_metni, bilanco_metni, mizan_metni, on_hesaplar
+
+
 def query_financial(soru: str):
     gelir_metni, bilanco_metni, mizan_metni, on_hesaplar = load_formatted_financial_tables()
 
-    prompt = f"""Sen resmi şirket verilerini inceleyen bir mali işler uzmanısın.
+    prompt = f"""Sen resmi şirket verilerini inceleyen bir mali müşavir ve finans analistisin.
 Aşağıda şirketin 2024 yılı resmi mali tabloları yer almaktadır:
 
 === ÖZET DEĞERLER ===
@@ -150,9 +152,10 @@ Aşağıda şirketin 2024 yılı resmi mali tabloları yer almaktadır:
 Kullanıcı Sorusu: {soru}
 
 GÖREVİN:
-1. Kullanıcı sorusuna tablolardaki gerçek değerlere dayanarak doğrudan yanıt ver.
-2. Hesap kodu veya kalem adı sorulmuşsa, ilgili satırın tutarını ve borç/alacak durumunu net yaz.
-3. İstenen veri tablolarda yoksa yalnızca "Belgelerde bu bilgi bulunmamaktadır." de.
+1. Kullanıcı sorusuna tablolardaki gerçek değerlere göre net ve doğrudan yanıt ver.
+2. Eğer genel bir grup kalemi (örneğin 'Ticari Alacaklar') sorulmuşsa hem bilançodaki ana grup toplamını hem de mizandaki alt hesapları net tutarlarıyla belirt.
+3. Hesap kodu veya kalem sorulmuşsa ilgili satırın tutarını ve borç/alacak bakiyesini açıkça yaz.
+4. İstenen veri tablolarda yoksa sadece 'Belgelerde bu bilgi bulunmamaktadır.' de.
 
 Cevap:"""
 
@@ -162,12 +165,14 @@ Cevap:"""
         options={"temperature": 0.0}
     )
     return clean_text(cevap["message"]["content"]), "Mali Tablolar (Mizan & Bilanço & Gelir Tablosu)"
+
+
 def query_hybrid(soru: str):
     baglam_mevzuat, kaynaklar = retrieve_mevzuat(soru, top_k=3)
     gelir_metni, bilanco_metni, mizan_metni, on_hesaplar = load_formatted_financial_tables()
 
     prompt = f"""Sen enerji sektörü finans ve EPDK regülasyonu uzmanısın.
-Aşağıda şirketin mevzuat metinleri ve mali tabloları yer almaktadır:
+Aşağıda mevzuat metinleri ve şirketin resmi mali tabloları yer almaktadır:
 
 === MEVZUAT METİNLERİ ===
 {baglam_mevzuat}
@@ -181,12 +186,11 @@ Aşağıda şirketin mevzuat metinleri ve mali tabloları yer almaktadır:
 Kullanıcı Sorusu: {soru}
 
 GÖREVİN VE ÇIKTI FORMATI:
-1. **Mevzuat Açıklaması**: SADECE sorulan konuyla doğrudan ilgili mevzuat maddelerini ve kurallarını özetle.
-2. **Mali Tablo Tespiti**: SADECE soruda bahsi geçen hesapları tutarları ve bakiye durumlarıyla yaz.
-3. **Finansal Değerlendirme**: 
-   - Sorulan konunun şirketin mali durumuna veya regülasyon süreçlerine etkisini açıkla.
-   - Bilanço aktif varlıklarını (253 vb.) gelir tablosu hasılatıyla asla toplama; (253-257) farkını "Net Defter Değeri (Varlık Tabanı)" olarak belirt.
-   - Soruda geçmeyen alakasız konuları (örneğin DVT sorulurken kayıp-kaçağı) yanıta ekleme.
+1. **Mevzuat Açıklaması**: Sadece soruyla doğrudan ilgili mevzuat maddelerini ve kurallarını listele.
+2. **Mali Tablo Tespiti**: Sadece soruda geçen hesap kalemlerinin (örn. 253, 257 veya 602) tablodaki bakiye tutarlarını yaz. Alakasız kasa/banka rakamlarını buraya ekleme.
+3. **Finansal Değerlendirme**:
+   - DVT sorularında: (253 - 257) farkını "Net Defter Değeri (Net Varlık Tabanı)" olarak belirt. Duran varlıkları gelir tablosu kârından veya hasılatından ASLA çıkarma ya da ekleme.
+   - Kayıp-kaçak sorularında: Fiili teknik kayıp-kaçak oranının operasyonel bir veri olup mali tablolarda yer almadığını, bu nedenle hedefin aşılıp aşılmadığının tablodan bilinemeyeceğini belirt. Olası azami yaptırımın ise Toplam Dağıtım Geliri (209.500.000 TL) üzerinden azami %2 tavan indirimi (4.190.000 TL) olabileceğini açıkla. Uydurma matematik formülleri üretme.
 
 Cevap:"""
 
@@ -197,6 +201,8 @@ Cevap:"""
     )
     kaynak_str = ", ".join(kaynaklar) if kaynaklar else "EPDK Mevzuatı"
     return clean_text(cevap["message"]["content"]), f"Karma (Mali Tablolar & {kaynak_str})"
+
+
 def query_mevzuat(soru: str):
     baglam, kaynaklar = retrieve_mevzuat(soru, top_k=3)
     if not baglam:
@@ -211,8 +217,9 @@ Aşağıdaki mevzuat metinlerini kullanarak soruyu yanıtla.
 Kullanıcı Sorusu: {soru}
 
 GÖREVİN VE ÇIKTI FORMATI:
-- Soruda istenen tüm maddeleri doğrudan ve net şekilde açıkla.
-- Yanıtının altına mutlaka 'Referans: [Belge Adı] MADDE X' şeklinde ilgili belge adını ve maddesini yaz.
+- Soruda istenen varlık veya maddeyi metinden bularak doğrudan yanıtla.
+- Kullanıcı sadece yeni bir konuyu sorduysa (örn. bilgi işlem veya sayaçlar), önceki konuları (trafo merkezleri vb.) gereksiz yere cevaba dahil etme.
+- Yanıtının altına mutlaka 'Referans: [Belge Adı] MADDE X' şeklinde kaynak maddesini ekle.
 - Asla 'Satır 1:', 'Cevap:' gibi başlıklar kullanma.
 - Bilgi metinde yoksa sadece 'Belgelerde bu bilgi bulunmamaktadır.' yaz.
 
@@ -225,7 +232,6 @@ Cevap:"""
     )
     raw_content = clean_text(cevap["message"]["content"])
 
-    # Modelin referans verdiği asıl belgeyi yakala
     ref_match = re.findall(r'\[(EPDK_[^\]]+\.txt)\]', raw_content)
     if ref_match:
         kaynak_str = ", ".join(sorted(list(set(ref_match))))
@@ -242,13 +248,12 @@ def rewrite_query_with_context(user_query: str, user_messages: list) -> str:
 
     temiz_q = user_query.strip().lower()
 
-    # Soru zaten en az 6 kelimelik tam bir soruysa dokunma
     if len(temiz_q.split()) >= 6 and not any(k in temiz_q for k in ["peki", "ya", "ise", "bunun", "ondan"]):
         return user_query
 
     # Geçmişteki en son tam soru cümlesini bul
     soru_ekleri = ["nedir", "kaçtır", "ne kadar", "kaç", "nasıl", "kimdir", "nelerdir",
-                   "mi", "mı", "mu", "mü", "yıldır"]
+                   "mi", "mı", "mu", "mü", "yıldır", "sınırı"]
     ana_soru = user_messages[-1]
     for msg in reversed(user_messages):
         m_temiz = msg.strip().lower()
@@ -257,18 +262,18 @@ def rewrite_query_with_context(user_query: str, user_messages: list) -> str:
             break
 
     prompt = f"""Kullanıcının önceki sorusu: "{ana_soru}"
-Kullanıcının yeni girdisi: "{user_query}"
+Kullanıcının yeni kısa girdisi: "{user_query}"
 
 GÖREV:
-Yeni girdi önceki sorunun bir devamı/takibidir. Önceki sorudaki soru kalıbını alıp yeni girdiye uygula.
-Önceki sorunun eski öznesini YENİ GİRDİ İLE TAMAMEN DEĞİŞTİR. Eski özneyi soruya katma.
+Yeni girdi önceki sorunun bir devamıdır. Önceki sorunun genel soru fiilini/kalıbını al, ancak önceki sorudaki ESKİ ÖZNEYİ TAMAMEN AT.
+Yeni girdideki konuyu sorunun tek öznesi yap.
 
 Örnekler:
-- Önceki: "Trafo merkezleri için amortisman süresi kaç yıldır?" | Yeni: "dağıtım" -> "Dağıtım hatları için amortisman süresi kaç yıldır?"
-- Önceki: "Trafo merkezleri için amortisman süresi kaç yıldır?" | Yeni: "bilgi işlem" -> "Bilgi işlem sistemleri için amortisman süresi kaç yıldır?"
-- Önceki: "A grubu bölgelerde kayıp kaçak sınırı ne?" | Yeni: "b grubu" -> "B grubu bölgelerde kayıp kaçak sınırı nedir?"
+- Önceki: "Trafo merkezleri için amortisman süresi kaç yıldır?" | Yeni: "bilgi işlem" -> "Bilgi işlem ve SCADA sistemleri için amortisman süresi kaç yıldır?"
+- Önceki: "Trafo merkezleri için amortisman süresi kaç yıldır?" | Yeni: "sayaçlar" -> "Sayaçlar ve ölçüm sistemleri için amortisman süresi kaç yıldır?"
+- Önceki: "A grubu bölgelerde kayıp-kaçak hedef üst sınırı nedir?" | Yeni: "b ve c" -> "B ve C grubu bölgelerde kayıp-kaçak hedef üst sınırı nedir?"
 
-Sadece yeni Türkçe soru cümlesini yaz:"""
+Sadece yeni Türkçe soruyu tek satır olarak yaz:"""
 
     res = ollama.chat(
         model="qwen2.5:7b",
