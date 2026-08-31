@@ -130,7 +130,6 @@ def load_formatted_financial_tables():
 
     return gelir_metni, bilanco_metni, mizan_metni, on_hesaplar
 
-
 def query_financial(soru: str):
     gelir_metni, bilanco_metni, mizan_metni, on_hesaplar = load_formatted_financial_tables()
 
@@ -153,8 +152,8 @@ Kullanıcı Sorusu: {soru}
 
 GÖREVİN:
 1. Kullanıcı sorusuna tablolardaki gerçek değerlere göre net ve doğrudan yanıt ver.
-2. Eğer genel bir grup kalemi (örneğin 'Ticari Alacaklar') sorulmuşsa hem bilançodaki ana grup toplamını hem de mizandaki alt hesapları net tutarlarıyla belirt.
-3. Hesap kodu veya kalem sorulmuşsa ilgili satırın tutarını ve borç/alacak bakiyesini açıkça yaz.
+2. Genel grup kalemleri (örn. 'Ticari Alacaklar') sorulduğunda; mizandaki brüt alt hesap tutarını (120 vb.) ve bilançoda raporlanan net grup tutarını ayrı ayrı, net bir dille belirt (mizan ile bilançoyu asla birbirine ekleme veya birlikte toplama).
+3. Hesap kodu sorulduğunda ilgili satırın tutarını ve borç/alacak bakiyesini açıkça yaz.
 4. İstenen veri tablolarda yoksa sadece 'Belgelerde bu bilgi bulunmamaktadır.' de.
 
 Cevap:"""
