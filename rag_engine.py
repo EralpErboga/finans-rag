@@ -7,11 +7,12 @@ import ollama
 
 VECTOR_DB_PATH = "db/mevzuat_vektorleri.json"
 EXCEL_PATH = "data/mizan_bilanco_dummy_2024.xlsx"
-
-
 def clean_text(text: str) -> str:
-    """Metindeki istenmeyen unicode karakterleri ve citation kalıplarını temizler."""
-    text = re.sub(r'[\u4e00-\u9fff]+', '', text)
+    """Metindeki istenmeyen unicode karakterleri, noktalama ve dosya adı kalıplarını temizler."""
+    # Çince / Japonca / Asya karakterleri ve noktalama işaretlerini temizle (örn: 。)
+    text = re.sub(r'[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]+', '', text)
+    # [EPDK_...txt] gibi köşeli parantezli dosya adlarını ve önündeki iki noktayı temizle
+    text = re.sub(r':?\s*\[EPDK_[^\]]+\.txt\]', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\]+\]', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\[\s*\]', '', text)
     text = re.sub(r'[ \t]+', ' ', text)
@@ -35,10 +36,10 @@ def cosine_similarity(vec_a, vec_b):
     norm_a = math.sqrt(sum(a * a for a in vec_a))
     norm_b = math.sqrt(sum(b * b for b in vec_b))
     return dot / (norm_a * norm_b) if (norm_a and norm_b) else 0.0
+from collections import Counter
 
-
-def retrieve_mevzuat(soru: str, top_k: int = 3):
-    """Vektör veritabanından en alakalı mevzuat metinlerini getirir."""
+def retrieve_mevzuat(soru: str, top_k: int = 4):
+    """Vektör veritabanından en alakalı mevzuat metinlerini getirir ve kaynak ağırlıklandırması yapar."""
     if not os.path.exists(VECTOR_DB_PATH):
         return "", []
 
@@ -48,18 +49,31 @@ def retrieve_mevzuat(soru: str, top_k: int = 3):
     res = ollama.embeddings(model="bge-m3", prompt=soru)
     soru_vektoru = res["embedding"]
 
+    q_lower = normalize_text(soru)
+
     skorlar = []
     for item in db:
         skor = cosine_similarity(soru_vektoru, item["embedding"])
+        src = item.get("source", "")
+
+        # Tematik anahtar kelime ağırlıklandırması (Keyword Boosting)
+        if any(k in q_lower for k in ["takvim", "raporlama", "ceyrek", "çeyrek", "genelge"]) and "Finansal_Raporlama" in src:
+            skor += 0.35
+        elif any(k in q_lower for k in ["amortisman", "dvt", "omur", "ömür", "sure", "süresi"]) and "Yatirim_Amortisman" in src:
+            skor += 0.35
+        elif any(k in q_lower for k in ["kayip", "kayıp", "kacak", "kaçak", "hedef"]) and "Kayip_Kacak" in src:
+            skor += 0.35
+
         skorlar.append((skor, item))
 
     skorlar.sort(key=lambda x: x[0], reverse=True)
     en_iyi = [item for _, item in skorlar[:top_k]]
 
-    baglam = "\n\n".join([f"[{item['source']}]\n{item['content']}" for item in en_iyi])
-    kaynaklar = list(set([item["source"] for item in en_iyi]))
-    return baglam, kaynaklar
+    # En yüksek skora sahip doğru belgenin kaynağını al
+    en_alakali_kaynak = [skorlar[0][1]["source"]] if skorlar else []
 
+    baglam = "\n\n".join([f"[{item['source']}]\n{item['content']}" for item in en_iyi])
+    return baglam, en_alakali_kaynak
 
 def load_formatted_financial_tables():
     if not os.path.exists(EXCEL_PATH):
@@ -130,6 +144,7 @@ def load_formatted_financial_tables():
 
     return gelir_metni, bilanco_metni, mizan_metni, on_hesaplar
 
+
 def query_financial(soru: str):
     gelir_metni, bilanco_metni, mizan_metni, on_hesaplar = load_formatted_financial_tables()
 
@@ -150,11 +165,11 @@ Aşağıda şirketin 2024 yılı resmi mali tabloları yer almaktadır:
 
 Kullanıcı Sorusu: {soru}
 
-GÖREVİN:
-1. Kullanıcı sorusuna tablolardaki gerçek değerlere göre net ve doğrudan yanıt ver.
-2. Genel grup kalemleri (örn. 'Ticari Alacaklar') sorulduğunda; mizandaki brüt alt hesap tutarını (120 vb.) ve bilançoda raporlanan net grup tutarını ayrı ayrı, net bir dille belirt (mizan ile bilançoyu asla birbirine ekleme veya birlikte toplama).
-3. Hesap kodu sorulduğunda ilgili satırın tutarını ve borç/alacak bakiyesini açıkça yaz.
-4. İstenen veri tablolarda yoksa sadece 'Belgelerde bu bilgi bulunmamaktadır.' de.
+GÖREVİN VE KATI ÇIKTI KURALLARI:
+- Sorulan stok, malzeme, bakiye veya borç/alacak tutarını tablolardan doğrudan bularak net ve tek parça bir yanıt ver.
+- 150 İlk Madde ve Malzeme (Şebeke Malzemesi) hesabı Dönen Varlıklar / Stoklar grubundadır (Maddi Duran Varlık değildir).
+- Sistem kurallarını veya madde numaralarını cevabın içine ASLA kopyalama.
+- Bilgi tablolarda yoksa sadece 'Belgelerde bu bilgi bulunmamaktadır.' yaz.
 
 Cevap:"""
 
@@ -170,6 +185,20 @@ def query_hybrid(soru: str):
     baglam_mevzuat, kaynaklar = retrieve_mevzuat(soru, top_k=3)
     gelir_metni, bilanco_metni, mizan_metni, on_hesaplar = load_formatted_financial_tables()
 
+    q_lower = normalize_text(soru)
+    is_dvt_query = any(k in q_lower for k in ["dvt", "253", "255", "demirbas", "demirbaş", "tesis", "varlik", "varlık"])
+
+    if is_dvt_query:
+        gorev_kurallari = """GÖREVİN:
+1. **Mevzuat Açıklaması**: DVT'ye giriş koşullarını (işletmeye alınma, yatırım programında yer alma, 253/255'te muhasebeleşme) özetle.
+2. **Mali Tablo Tespiti**: Sorulan duran varlık hesabının bakiyesini belirt.
+3. **Finansal Değerlendirme**: İlgili duran varlığın DVT şartlarını karşılama durumunu açıkla."""
+    else:
+        gorev_kurallari = """GÖREVİN:
+1. **Mevzuat Açıklaması**: Tebliğdeki hedef oranları (%8, %12, %18) ve azami %2 gelir tavanı indirim kuralını özetle.
+2. **Mali Tablo Tespiti**: 602 Diğer Gelirler hesabındaki tutarı belirt.
+3. **Finansal Değerlendirme**: Fiili kayıp-kaçak oranı tablolarda yer almadığından aşım durumunun tespit edilemeyeceğini, olası azami yaptırımın ise Toplam Dağıtım Geliri (209.500.000 TL) üzerinden azami %2 tavan indirimi olabileceğini açıkla."""
+
     prompt = f"""Sen enerji sektörü finans ve EPDK regülasyonu uzmanısın.
 Aşağıda mevzuat metinleri ve şirketin resmi mali tabloları yer almaktadır:
 
@@ -184,12 +213,7 @@ Aşağıda mevzuat metinleri ve şirketin resmi mali tabloları yer almaktadır:
 
 Kullanıcı Sorusu: {soru}
 
-GÖREVİN VE ÇIKTI FORMATI:
-1. **Mevzuat Açıklaması**: Sadece soruyla doğrudan ilgili mevzuat maddelerini ve kurallarını listele.
-2. **Mali Tablo Tespiti**: Sadece soruda geçen hesap kalemlerinin (örn. 253, 257 veya 602) tablodaki bakiye tutarlarını yaz. Alakasız kasa/banka rakamlarını buraya ekleme.
-3. **Finansal Değerlendirme**:
-   - DVT sorularında: (253 - 257) farkını "Net Defter Değeri (Net Varlık Tabanı)" olarak belirt. Duran varlıkları gelir tablosu kârından veya hasılatından ASLA çıkarma ya da ekleme.
-   - Kayıp-kaçak sorularında: Fiili teknik kayıp-kaçak oranının operasyonel bir veri olup mali tablolarda yer almadığını, bu nedenle hedefin aşılıp aşılmadığının tablodan bilinemeyeceğini belirt. Olası azami yaptırımın ise Toplam Dağıtım Geliri (209.500.000 TL) üzerinden azami %2 tavan indirimi (4.190.000 TL) olabileceğini açıkla. Uydurma matematik formülleri üretme.
+{gorev_kurallari}
 
 Cevap:"""
 
@@ -198,28 +222,26 @@ Cevap:"""
         messages=[{"role": "user", "content": prompt}],
         options={"temperature": 0.0}
     )
-    kaynak_str = ", ".join(kaynaklar) if kaynaklar else "EPDK Mevzuatı"
+    kaynak_str = kaynaklar[0] if kaynaklar else "EPDK Mevzuatı"
     return clean_text(cevap["message"]["content"]), f"Karma (Mali Tablolar & {kaynak_str})"
 
-
 def query_mevzuat(soru: str):
-    baglam, kaynaklar = retrieve_mevzuat(soru, top_k=3)
+    baglam, kaynaklar = retrieve_mevzuat(soru, top_k=4)
     if not baglam:
         return "Belgelerde bu bilgi bulunmamaktadır.", "Hata"
 
-    prompt = f"""Sen resmi bir mevzuat uzmanısın.
-Aşağıdaki mevzuat metinlerini kullanarak soruyu yanıtla.
+    prompt = f"""Sen resmi bir mevzuat ve regülasyon uzmanısın.
+Aşağıdaki mevzuat ve genelge metinlerini kullanarak soruyu Türkçe, akıcı, net ve tam cümlelerle yanıtla.
 
-=== MEVZUAT METNİ ===
+=== MEVZUAT METİNLERİ ===
 {baglam}
 
 Kullanıcı Sorusu: {soru}
 
-GÖREVİN VE ÇIKTI FORMATI:
-- Soruda istenen varlık veya maddeyi metinden bularak doğrudan yanıtla.
-- Kullanıcı sadece yeni bir konuyu sorduysa (örn. bilgi işlem veya sayaçlar), önceki konuları (trafo merkezleri vb.) gereksiz yere cevaba dahil etme.
-- Yanıtının altına mutlaka 'Referans: [Belge Adı] MADDE X' şeklinde kaynak maddesini ekle.
-- Asla 'Satır 1:', 'Cevap:' gibi başlıklar kullanma.
+GÖREVİN VE ÇIKTI KURALLARI:
+- Sorulan oranları veya süreleri açık ve ayrı ayrı belirt (Örnek: "B Grubu bölgelerde %12, C Grubu bölgelerde ise %18'dir.").
+- Rakamları ve yüzde işaretlerini birbirine yapıştırma.
+- Belge adını, köşeli parantezleri veya 'Referans:' satırlarını metne ASLA ekleme.
 - Bilgi metinde yoksa sadece 'Belgelerde bu bilgi bulunmamaktadır.' yaz.
 
 Cevap:"""
@@ -230,18 +252,14 @@ Cevap:"""
         options={"temperature": 0.0}
     )
     raw_content = clean_text(cevap["message"]["content"])
+    clean_answer = re.sub(r'Referans:.*', '', raw_content, flags=re.IGNORECASE).strip()
 
-    ref_match = re.findall(r'\[(EPDK_[^\]]+\.txt)\]', raw_content)
-    if ref_match:
-        kaynak_str = ", ".join(sorted(list(set(ref_match))))
-    else:
-        kaynak_str = ", ".join(kaynaklar) if kaynaklar else "EPDK Mevzuatı"
-
-    return raw_content, f"EPDK Mevzuatı ({kaynak_str})"
+    kaynak_str = kaynaklar[0] if kaynaklar else "EPDK Mevzuatı"
+    return clean_answer, f"EPDK Mevzuatı ({kaynak_str})"
 
 
 def rewrite_query_with_context(user_query: str, user_messages: list) -> str:
-    """Kullanıcının kısa veya takip sorularını önceki ana konuya bağlayarak tamamlar."""
+    """Kullanıcının kısa veya takip sorularını önceki konuyu temizleyerek tamamlar."""
     if not user_messages:
         return user_query
 
@@ -250,29 +268,30 @@ def rewrite_query_with_context(user_query: str, user_messages: list) -> str:
     if len(temiz_q.split()) >= 6 and not any(k in temiz_q for k in ["peki", "ya", "ise", "bunun", "ondan"]):
         return user_query
 
-    # Geçmişteki en son tam soru cümlesini bul
     soru_ekleri = ["nedir", "kaçtır", "ne kadar", "kaç", "nasıl", "kimdir", "nelerdir",
-                   "mi", "mı", "mu", "mü", "yıldır", "sınırı"]
+                   "mi", "mı", "mu", "mü", "yıldır", "sınırı", "zaman", "şart", "koşul"]
     ana_soru = user_messages[-1]
     for msg in reversed(user_messages):
         m_temiz = msg.strip().lower()
-        if len(m_temiz.split()) >= 4 and any(k in m_temiz for k in soru_ekleri):
+        if len(m_temiz.split()) >= 3 and any(k in m_temiz for k in soru_ekleri):
             ana_soru = msg
             break
 
-    prompt = f"""Kullanıcının önceki sorusu: "{ana_soru}"
-Kullanıcının yeni kısa girdisi: "{user_query}"
+    prompt = f"""ÖNCEKİ SORU: "{ana_soru}"
+YENİ GİRDİ: "{user_query}"
 
 GÖREV:
-Yeni girdi önceki sorunun bir devamıdır. Önceki sorunun genel soru fiilini/kalıbını al, ancak önceki sorudaki ESKİ ÖZNEYİ TAMAMEN AT.
-Yeni girdideki konuyu sorunun tek öznesi yap.
+Yeni girdi önceki sorunun bir devamıdır.
+Önceki sorudaki soru kalıbını ("...için amortisman süresi kaç yıldır?", "...hedef üst sınırı nedir?" vb.) al.
+Önceki soruda geçen varlık/konu adını KESİNLİKLE AT ve YALNIZCA yeni girdiyi soru kalıbıyla birleştir.
+Eski sorudaki kelimeleri (örn. 'trafo merkezleri') asla yeni soruya ekleme.
 
-Örnekler:
-- Önceki: "Trafo merkezleri için amortisman süresi kaç yıldır?" | Yeni: "bilgi işlem" -> "Bilgi işlem ve SCADA sistemleri için amortisman süresi kaç yıldır?"
-- Önceki: "Trafo merkezleri için amortisman süresi kaç yıldır?" | Yeni: "sayaçlar" -> "Sayaçlar ve ölçüm sistemleri için amortisman süresi kaç yıldır?"
+Örnek:
+- Önceki: "Trafo merkezleri için amortisman süresi kaç yıldır?" | Yeni: "orta gerilim şebeke hatları" -> "Orta gerilim şebeke hatları için amortisman süresi kaç yıldır?"
+- Önceki: "Trafo merkezleri için amortisman süresi kaç yıldır?" | Yeni: "bilgi işlem" -> "Bilgi işlem sistemleri için amortisman süresi kaç yıldır?"
 - Önceki: "A grubu bölgelerde kayıp-kaçak hedef üst sınırı nedir?" | Yeni: "b ve c" -> "B ve C grubu bölgelerde kayıp-kaçak hedef üst sınırı nedir?"
 
-Sadece yeni Türkçe soruyu tek satır olarak yaz:"""
+Sadece yeni soruyu tek satır olarak yaz:"""
 
     res = ollama.chat(
         model="qwen2.5:7b",
@@ -281,18 +300,39 @@ Sadece yeni Türkçe soruyu tek satır olarak yaz:"""
     )
     yeni_soru = clean_text(res["message"]["content"]).strip('"\n ')
     return yeni_soru if yeni_soru else user_query
-
-
 def normalize_text(text: str) -> str:
-    """Türkçe karakterleri normalize ederek küçük harfe çevirir."""
-    mapping = {'İ': 'i', 'I': 'ı', 'Ş': 'ş', 'Ğ': 'ğ', 'Ü': 'ü', 'Ö': 'ö', 'Ç': 'ç'}
+    """Türkçe karakterleri ve şapkalı harfleri normalize ederek küçük harfe çevirir."""
+    mapping = {
+        'İ': 'i', 'I': 'ı', 'Ş': 'ş', 'Ğ': 'ğ', 'Ü': 'ü', 'Ö': 'ö', 'Ç': 'ç',
+        'â': 'a', 'Â': 'a', 'î': 'i', 'Î': 'i', 'û': 'u', 'Û': 'u'
+    }
     for k, v in mapping.items():
         text = text.replace(k, v)
     return text.lower().strip()
-
-
 def answer_query(user_query: str, chat_history: list = None, last_focused_index: int = None):
     q_norm = normalize_text(user_query)
+
+    # 1. Kelime listeleri
+    mevzuat_kelimeleri = [
+        r"\bhedef\b", r"\bkayıp\b", r"\bkaçak\b", r"\btebliğ\b",
+        r"\byönetmelik\b", r"\bdvt\b", r"\bamortisman\b", r"\bsüre\b",
+        r"\bsüresi\b", r"\btakvim\b", r"\bmevzuat\b", r"\bkanun\b",
+        r"\bmadde\b", r"\bkurul\b", r"\bepdk\b", r"\bbildirim\b"
+    ]
+
+    finans_kelimeleri = [
+        r"\bgelir", r"\bgider", r"\byönetim", r"\bkasa",
+        r"\bbanka", r"\bmizan", r"\bbilanço", r"\btutar",
+        r"\bhesap", r"\btl\b", r"\btry\b", r"\bnakit",
+        r"\balacak", r"\bborç", r"\bticari", r"\bşüpheli",
+        r"\baktif", r"\bpasif", r"\bözkaynak", r"\bkâr", r"\bkar",
+        r"\bzarar", r"\btopla", r"\btoplam", r"\bbakiye",
+        r"\bstok", r"\bstoklar", r"\bstoklarımızda", r"\bmalzeme",
+        r"\bmalzemesi", r"\bmalzememiz", r"\benvanter",
+        r"\bkredi", r"\bkrediler", r"\bsermaye", r"\bhizmet",
+        r"\bmaliyet", r"\bvarlık", r"\bvarlığımız", r"\byükümlülük",
+        r"\bbrüt", r"\bsatış", r"\bfaaliyet", r"\bfark"
+    ]
 
     # Gerçek kullanıcı mesajlarını ayıkla
     meta_kaliplar = ["ne sordum", "neydi", "özetle", "ozetle", "neler konustuk",
@@ -301,7 +341,7 @@ def answer_query(user_query: str, chat_history: list = None, last_focused_index:
     user_messages = [m for m in raw_user_msgs if not any(k in normalize_text(m) for k in meta_kaliplar)]
     total_questions = len(user_messages)
 
-    # 1. SOHBET ÖZETİ
+    # 2. SOHBET ÖZETİ
     ozet_kaliplari = ["neler konustuk", "neler konuştuk", "özetle", "ozetle",
                       "özet", "ozet", "bütün sorular", "tum sorular", "tüm mesajlar"]
     if any(k in q_norm for k in ozet_kaliplari):
@@ -310,7 +350,7 @@ def answer_query(user_query: str, chat_history: list = None, last_focused_index:
         liste = "\n".join([f"{i + 1}. {m}" for i, m in enumerate(user_messages)])
         return f"Şu ana kadar sorduğunuz {total_questions} asıl soru:\n\n{liste}", "Sohbet Belleği", last_focused_index
 
-    # 2. MESAJ İÇİ KELİME SORGULARI
+    # 3. MESAJ İÇİ KELİME SORGULARI
     kelime_sorgu_kaliplari = ["kelimesi neydi", "kelime nedir", "kelimeyi söyle", "kelime hangisi"]
     sayilar = [int(s) for s in re.findall(r'\d+', user_query)]
 
@@ -332,8 +372,8 @@ def answer_query(user_query: str, chat_history: list = None, last_focused_index:
                 target_idx + 1
             )
 
-    # 3. İÇERİK ARAMASI
-    if any(k in q_norm for k in ["hangi", "nerede", "ne zaman"]):
+    # 4. SOHBET GEÇMİŞİ İÇERİK ARAMASI
+    if any(k in q_norm for k in ["hangi soruda", "hangi mesajda", "nerede sordum", "nerede bahsettim", "ne zaman sordum", "ne zaman bahsettim", "hangi mesajimda"]):
         stop_words = {
             "hangi", "mesajda", "mesaj", "soruda", "soru", "sordumu", "sordum",
             "sordugumu", "sorduğumu", "nerede", "ne", "zaman", "diye", "veya",
@@ -351,11 +391,11 @@ def answer_query(user_query: str, chat_history: list = None, last_focused_index:
                     return f"Bu konuyu baştan **{i + 1}. sorunuzda** sormuştunuz: \"{m}\"", "Sohbet Belleği", i + 1
             return "Sohbet geçmişinde bu içerikle eşleşen bir soru bulunamadı.", "Sohbet Belleği", last_focused_index
 
-    # 4. SOHBET BELLEĞİ (Bağıl ve Mutlak İndeksler)
+    # 5. SOHBET BELLEĞİ (Bağıl ve Mutlak İndeksler)
     gecmis_kaliplari = ["mesaj", "soru", "sord", "neydi", "ilk", "son",
                         "onceki", "önceki", "sonraki", "sonrakinde", "ondan"]
     if any(k in q_norm for k in gecmis_kaliplari) and user_messages and not any(
-            k in q_norm for k in ["hedef", "amortisman", "gelir", "gider"]):
+            k in q_norm for k in ["hedef", "amortisman", "gelir", "gider", "takvim", "sure", "süresi", "bildirim", "stok", "malzeme"]):
         delta = sayilar[0] if sayilar else 1
 
         if any(k in q_norm for k in ["ondan", "sonraki", "sonrakinde", "onceki", "önceki"]):
@@ -396,31 +436,29 @@ def answer_query(user_query: str, chat_history: list = None, last_focused_index:
         if "son" in q_norm:
             return f"Son sorunuzda şunu sormuştunuz: \"{user_messages[-1]}\"", "Sohbet Belleği", total_questions
 
-    # 5. KARMA / HİBRİT SORGULAR
-    mevzuat_kelimeleri = [r"\bhedef\b", r"\bkayıp\b", r"\bkaçak\b", r"\btebliğ\b",
-                          r"\byönetmelik\b", r"\bdvt\b", r"\bamortisman\b", r"\bsüre\b", r"\bsüresi\b"]
-    finans_kelimeleri = [r"\bgelir\b", r"\bgider\b", r"\byönetim\b", r"\bkasa\b",
-                         r"\bbanka\b", r"\bmizan\b", r"\bbilanço\b", r"\btutar\b",
-                         r"\bhesap\b", r"\btl\b", r"\btry\b", r"\bnakit\b",
-                         r"\balacak\b", r"\bborç\b", r"\bticari\b", r"\bşüpheli\b",
-                         r"\baktif\b", r"\bpasif\b", r"\bözkaynak\b", r"\bkâr\b",
-                         r"\bzarar\b", r"\btopla\b", r"\btoplam\b", r"\bbakiye\b"]
-
+    # 6. KARMA / HİBRİT SORGULAR (Fonksiyon ana gövdesinde)
     has_mevzuat = any(re.search(k, q_norm) for k in mevzuat_kelimeleri)
     has_finans = any(re.search(k, q_norm) for k in finans_kelimeleri)
     has_hesap_kodu = bool(re.search(r'\b[1-7]\d{2}\b', user_query))
     has_dvt = "dvt" in q_norm or "düzenlenmiş varlık" in q_norm
 
-    if has_dvt or (has_mevzuat and has_finans) or ("tablo" in q_norm and has_mevzuat):
-        ans, src = query_hybrid(user_query)
-        return ans, src, last_focused_index
+    # Takvim/raporlama/süre soruları finans kelimesi içerse bile öncelikle saf mevzuata aittir
+    is_pure_mevzuat_topic = any(k in q_norm for k in [
+        "takvim", "takvimi", "bildirim suresi", "bildirim süresi", "amortisman suresi", "amortisman süresi"
+    ])
 
-    # 6. FİNANSAL TABLOLAR
-    if has_hesap_kodu or has_finans:
+    if not is_pure_mevzuat_topic:
+        if has_dvt or (("kayıp" in q_norm or "kaçak" in q_norm) and (
+                "gelir" in q_norm or "tablo" in q_norm or "etkiler" in q_norm)):
+            ans, src = query_hybrid(user_query)
+            return ans, src, last_focused_index
+
+    # 7. FİNANSAL TABLOLAR (Sadece net hesap/bakiye/tablo soruları)
+    if not is_pure_mevzuat_topic and (has_hesap_kodu or (has_finans and not has_mevzuat)):
         ans, src = query_financial(user_query)
         return ans, src, last_focused_index
 
-    # 7. MEVZUAT RAG (Dinamik Tamamlanmış Soru ile)
+    # 8. MEVZUAT RAG (Varsayılan Akış)
     aranacak_soru = rewrite_query_with_context(user_query, user_messages)
     ans, src = query_mevzuat(aranacak_soru)
     return ans, src, last_focused_index
